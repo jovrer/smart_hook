@@ -1,0 +1,13 @@
+// $Id$
+// vim:ft=javascript
+
+// If your extension references something external, use ARG_WITH
+// ARG_WITH("smart_hook", "for smart_hook support", "no");
+
+// Otherwise, use ARG_ENABLE
+// ARG_ENABLE("smart_hook", "enable smart_hook support", "no");
+
+if (PHP_SMART_HOOK != "no") {
+	EXTENSION("smart_hook", "smart_hook.c");
+}
+
