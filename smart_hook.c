@@ -46,7 +46,10 @@ typedef struct _zend_closure {
 typedef struct sh_func_unit_t {
 	zend_op_array *func_before;
 	zend_op_array *func_after;
-	
+	zend_closure *closure_before;
+	zend_closure *closure_after;
+	zval *obj_before;
+	zval *obj_after;
 }sh_func_unit_t;
 
 typedef struct sh_global_t{
@@ -54,6 +57,7 @@ typedef struct sh_global_t{
 	zval prefix_before;
 	zval prefix_after;	
 	HashTable func_lists;
+	int is_hooking;
 } sh_global_t;
 
 
@@ -70,7 +74,11 @@ typedef struct sh_global_t{
 #define INIT_SH_FUNC_UNIT(v) do {         \
 	v = (sh_func_unit_t*)emalloc(sizeof(sh_func_unit_t)); \
 	v->func_before = NULL;							 \
-	v->func_after = NULL;							 \
+	v->func_after = NULL;							\
+	v->closure_before = NULL;						\
+	v->closure_after = NULL;\
+	v->obj_before = NULL;\
+	v->obj_after = NULL;\
 } while(0)
 
 #define CONSTANT_EX(op_array, op) \
@@ -95,9 +103,18 @@ zend_op *get_next_op_m(zend_op_array *op_array TSRMLS_DC);
 zend_op_array* gen_op_array(zend_op_array *op_array, zend_function* func);
 
 ZEND_API void (*_zend_execute_ex)(zend_execute_data *execute_data TSRMLS_DC);	
+ZEND_API void (*_zend_execute_internal)(zend_execute_data *execute_data_ptr, zend_fcall_info *fci, int return_value_used TSRMLS_DC);	
+
+
+
 
 
 int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC);
+int wrap_zend_execute_internal(zend_execute_data *execute_data_ptr, zend_fcall_info *fci, int return_value_used TSRMLS_DC);
+
+
+
+
 
 
 
@@ -175,6 +192,8 @@ PHP_MINIT_FUNCTION(smart_hook)
 	*/	
 
 	//setup_hook();
+
+	init_sh_global();
 	
 	return SUCCESS;
 }
@@ -187,6 +206,9 @@ PHP_MSHUTDOWN_FUNCTION(smart_hook)
 	/* uncomment this line if you have INI entries
 	UNREGISTER_INI_ENTRIES();
 	*/
+
+	
+	
 	return SUCCESS;
 }
 /* }}} */
@@ -219,12 +241,10 @@ PHP_MINFO_FUNCTION(smart_hook)
 
 	/* Remove comments if you have entries in php.ini
 	DISPLAY_INI_ENTRIES();
-	*/
-	
-	
+	*/	
+
 }
 /* }}} */
-
 
 
 PHP_FUNCTION(sh_start)
@@ -236,9 +256,7 @@ PHP_FUNCTION(sh_start)
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sa", &func_name, &func_name_len, &func_hook_obj) == FAILURE) {
 		php_printf("param error\r\n");
 	    RETURN_NULL();
-	}
-
-	init_sh_global();
+	}	
 	
 	setup_hook();	
 	
@@ -256,18 +274,23 @@ PHP_FUNCTION(sh_start)
 			
 			((sh_func_unit_t*)func_unit)->func_before = gen_op_array(&(closure->func.op_array), &(closure->func));
 
+			((sh_func_unit_t*)func_unit)->closure_before = closure;
+			((sh_func_unit_t*)func_unit)->obj_before = *p_data;
 		}
 
-		if(SUCCESS == zend_hash_find(funcs_table, Z_STRVAL(sh_global.prefix_after), Z_STRLEN(sh_global.prefix_after)+1, &p_data)) {			
+		if(SUCCESS == zend_hash_find(funcs_table, Z_STRVAL(sh_global.prefix_after), Z_STRLEN(sh_global.prefix_after)+1, &p_data)) {
 			closure = (zend_closure *)zend_object_store_get_object(*p_data TSRMLS_CC);			
 			
 			((sh_func_unit_t*)func_unit)->func_after = gen_op_array(&(closure->func.op_array), &(closure->func));			
+
+			((sh_func_unit_t*)func_unit)->closure_after = closure;
+			((sh_func_unit_t*)func_unit)->obj_after = *p_data;
+			//call_user_function(HashTable * function_table, zval * * object_pp, zval * function_name, zval * retval_ptr, zend_uint param_count, zval * params [ ] TSRMLS_DC)
 		
 		}
 		
 		zend_hash_add(&sh_global.func_lists, func_name, strlen(func_name)+1, func_unit, sizeof(*func_unit), NULL);
 	}
-	
 	
 }
 
@@ -280,11 +303,13 @@ zend_op_array* gen_op_array(zend_op_array *op_array, zend_function* func)  {
 	end = opline + final_op_array->last;
 	while (opline < end) {
 		if(opline->opcode == ZEND_RETURN) {
-			//opline->opcode = ZEND_NOP;
-			//zend_vm_set_opcode_handler(opline);
+			opline->opcode = ZEND_USER_OPCODE_RETURN;
+			zend_vm_set_opcode_handler(opline);
 		}		
 		opline++;
 	}
+
+	//pass_two(final_op_array);
 
 	return final_op_array;
 }
@@ -306,7 +331,10 @@ static inline void zend_insert_literal(zend_op_array *op_array, const zval *zv, 
 
 PHP_FUNCTION(sh_stop)
 {
-	zend_execute_ex = _zend_execute_ex;
+	if(sh_global.is_hooking) {
+		sh_global.is_hooking = 0;
+		zend_execute_ex = _zend_execute_ex;
+	}	
 }
 
 
@@ -410,15 +438,32 @@ void init_sh_global() {
 	ZVAL_STRING(&sh_global.prefix_before, PRE_BEFORE, 0);
 	INIT_ZVAL(sh_global.prefix_after);
 	ZVAL_STRING(&sh_global.prefix_after, PRE_AFTER, 0);
+
+	
+	sh_global.is_hooking = 0;
 	
 	zend_hash_init(&sh_global.func_lists, MAX_COUNT_HOOKS, NULL, NULL, 1);	
 }
 
 void setup_hook() {
-	_zend_execute_ex = zend_execute_ex;
-	zend_execute_ex = wrap_zend_execute_ex;
+	if(!sh_global.is_hooking) {
+		sh_global.is_hooking = 1;
+		
+		_zend_execute_ex = zend_execute_ex;
+		zend_execute_ex = wrap_zend_execute_ex;
+
+		_zend_execute_internal = zend_execute_internal;
+		zend_execute_internal = wrap_zend_execute_internal;
+	}	
 }
 
+void unsetup_hook() {
+	if(sh_global.is_hooking) {
+		sh_global.is_hooking = 0;
+		
+		zend_execute_ex = _zend_execute_ex;	
+	}	
+}
 
 
 zend_op *get_next_op_m(zend_op_array *op_array TSRMLS_DC)
@@ -433,9 +478,161 @@ zend_op *get_next_op_m(zend_op_array *op_array TSRMLS_DC)
 	return next_op;
 }
 
+void copy_opcode(zend_op *des, zend_op *src) {
+	des->extended_value = src->extended_value;
+	des->handler = src->handler;
+	des->lineno = src->lineno;
+	des->op1 = src->op1;
+	des->op1_type = src->op1_type;
+	des->op2 = src->op2;
+	des->op2_type = src->op2_type;
+	des->opcode = src->opcode;
+	des->result = src->result;
+	des->result_type = src->result_type;
+}
+
+void merge_opcode_array(zend_op_array *final_opcode_array, zend_op_array *arr1, zend_op_array *arr2) {	
+	int op_size = 0;
+	if(arr1 != NULL && arr1->last > 0) {
+		op_size += arr1->last;
+	}
+	if(arr2 != NULL && arr2->last > 0) {
+		op_size += arr2->last;
+	}
+
+	init_op_array(final_opcode_array, ZEND_USER_FUNCTION, op_size TSRMLS_CC);	
+	
+	zend_op * opline = NULL;
+
+	if(arr1 != NULL && arr1->last > 0) {
+		for(int i=0; i < arr1->last; i++) {
+			opline = get_next_op_m(final_opcode_array);
+			copy_opcode(opline, arr1->opcodes+i);			
+		}
+	}
+	if(arr2 != NULL && arr2->last > 0) {
+		for(int i=0; i < arr2->last; i++) {
+			opline = get_next_op_m(final_opcode_array);
+			copy_opcode(opline, arr2->opcodes+i);
+		}
+	}	
+
+	final_opcode_array->fn_flags = ZEND_ACC_INTERACTIVE;	
+
+}
 
 
-int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC) {	
+void gen_pre_opcode_array1(zend_execute_data *execute_data, zend_op_array *final_opcode_array) {
+	
+	//init_op_array(final_opcode_array, ZEND_USER_FUNCTION, INITIAL_INTERACTIVE_OP_ARRAY_SIZE TSRMLS_CC);
+	init_op_array(final_opcode_array, ZEND_USER_FUNCTION, 1 TSRMLS_CC);
+	
+	zend_op * opline = NULL;
+
+	zend_uint arg_num = execute_data->opline->op1.num;
+	zval **param = zend_vm_stack_get_arg(arg_num TSRMLS_CC);
+	znode param_node;
+	param_node.op_type = IS_VAR;
+	INIT_PZVAL(&param_node.u.constant);	
+	ZVAL_ZVAL(&param_node.u.constant, *param, 1, 1);
+
+	if(arg_num > 0) {		
+		opline = get_next_op(final_opcode_array);
+		opline->opcode = ZEND_SEND_VAR_NO_REF;
+		opline->extended_value = ZEND_DO_FCALL;
+		SET_NODE(opline->op1, &param_node); 
+		opline->op2.opline_num = arg_num;
+		SET_UNUSED(opline->op2);
+	}
+
+	final_opcode_array->fn_flags = ZEND_ACC_INTERACTIVE;
+
+
+	//opline = get_next_op(final_opcode_array);
+	//opline->opcode = ZEND_SEND_VAR_NO_REF;
+	//opline->extended_value = ZEND_DO_FCALL;
+	
+	
+	
+	pass_two(final_opcode_array TSRMLS_DC);
+
+	//return &final_opcode_array;
+}
+
+
+void gen_pre_opcode_array(zend_execute_data *execute_data, zend_op_array *final_opcode_array, zend_op_array *orign_opcode_array) {	
+	int arg_num = 1;
+	init_op_array(final_opcode_array, ZEND_USER_FUNCTION, arg_num+1 TSRMLS_CC);
+	
+	zend_op * opline = NULL;
+
+	opline = get_next_op(final_opcode_array);
+	opline->opcode = ZEND_SEND_BY_REF;
+	SET_NODE(opline->op1, param);
+	//opline->op1_type = 
+	
+			
+	opline->op2.opline_num = arg_num;
+	SET_UNUSED(opline->op2);
+
+	opline = get_next_op(final_opcode_array);
+	opline->opcode = ZEND_DO_FCALL_BY_NAME;
+	SET_UNUSED(opline->op1);
+	SET_UNUSED(opline->op2);
+	opline->extended_value = 1;
+	
+	final_opcode_array->fn_flags = ZEND_ACC_INTERACTIVE;		
+	
+	pass_two(final_opcode_array TSRMLS_DC);	
+}
+
+
+/*
+zend_op_array *gen_params_opcodes1(zend_execute_data *execute_data, zend_op_array *op_array TSRMLS_DC) {
+	zend_op_array params_opcode_array;
+	
+	zend_uint arg_num = execute_data->opline->op1.num;
+	zval **param = zend_vm_stack_get_arg(arg_num TSRMLS_CC);
+	znode param_node;
+	param_node.op_type = IS_VAR;
+	INIT_PZVAL(&param_node.u.constant);	
+	ZVAL_ZVAL(&param_node.u.constant, *param, 1, 1);
+
+	if(arg_num > 0) {
+		int op_index = 0;
+		int opcode_size = arg_num + op_array->last;
+		init_op_array(&params_opcode_array, ZEND_USER_FUNCTION, opcode_size TSRMLS_CC);
+		zend_op * op_next = NULL;
+
+		for( ;op_index <arg_num; op_index++) {			
+			op_next = &(params_opcode_array.opcodes[params_opcode_array.last]);
+			params_opcode_array.last++;
+			op_next->opcode = ZEND_SEND_VAR_NO_REF;			
+			SET_NODE(op_next->op1, &param_node);			
+			
+			op_next->op2.opline_num = arg_num;
+			SET_UNUSED(op_next->op2);
+		}
+		op_index = 0;
+		for( ;op_index < op_array->last; op_index++) {
+			op_next = &(params_opcode_array.opcodes[params_opcode_array.last]);
+			params_opcode_array.last++;
+			op_next->opcode = op_array->opcodes[op_index].opcode;
+			op_next-> = op_array->opcodes[op_index].opcode;
+			//op_next->op
+			op_next->opcode = op_array->opcodes[op_index].opcode;
+			
+
+		}
+		
+
+		pass_two(&params_opcode_array TSRMLS_DC);
+		
+	}	
+}
+*/
+
+int wrap_zend_execute_ex_bak1(zend_execute_data *execute_data TSRMLS_DC) {	
 	char *real_func_name;
 	sh_func_unit_t *func_unit;
 	zend_op_array *orig_op_array = EG(active_op_array);
@@ -451,7 +648,6 @@ int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC) {
 	
 	php_printf("in wrap_zend_do_begin_function_call\r\n");
 
-	
 	zend_op_array *op_array = execute_data->op_array;
 	if(op_array->type == ZEND_USER_FUNCTION) {
 	//if(0) {
@@ -459,11 +655,84 @@ int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC) {
 		if(FAILURE == zend_hash_find(&sh_global.func_lists, real_func_name, strlen(real_func_name)+1, &func_unit)) {		
 			_zend_execute_ex(execute_data);
 		}
-		else {			
+		else {
+			call_slot *call = execute_data->call_slots + execute_data->opline->result.num;
+			
+			if(func_unit->closure_before != NULL) {
+				if(EXPECTED(Z_TYPE_P(func_unit->obj_before) == IS_OBJECT) && Z_OBJ_HANDLER_P(func_unit->obj_before, get_closure) &&	Z_OBJ_HANDLER_P(func_unit->obj_before, get_closure)(func_unit->obj_before, &call->called_scope, &call->fbc, &call->object TSRMLS_CC) == SUCCESS) {
+					if (call->object) {
+						Z_ADDREF_P(call->object);
+					}
+					call->num_additional_args = 0;
+					call->is_ctor_call = 0;					
+					execute_data->call = call;
+
+					execute_data->function_state.function = execute_data->call->fbc;
+					//zend_do_fcall_common_helper_SPEC(execute_data);
+					
+				}
+			}
+			
+			_zend_execute_ex(execute_data);
+			
+			if(func_unit->closure_after != NULL) {
+				
+			
+			}			
+		}
+	}
+	else {		
+		_zend_execute_ex(execute_data);
+		
+	}
+}
+
+
+int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC) {	
+	char *real_func_name;
+	sh_func_unit_t *func_unit;
+ 	zend_op_array *orig_op_array = EG(active_op_array);
+	zend_op **orig_opline = EG(opline_ptr);	
+	zval **orig_retval_ptr = EG(return_value_ptr_ptr);
+
+	zval ***params = NULL;
+	int n_params = 0;
+	zval *retval_ptr;
+	zend_op *opline, *end;
+
+	ALLOC_INIT_ZVAL(retval_ptr);
+	
+	php_printf("in wrap_zend_do_begin_function_call\r\n");
+
+	zend_op_array *op_array = execute_data->op_array;
+	if(op_array->type == ZEND_USER_FUNCTION) {
+	//if(0) {
+		real_func_name = op_array->function_name;
+		if(FAILURE == zend_hash_find(&sh_global.func_lists, real_func_name, strlen(real_func_name)+1, &func_unit)) {
+			_zend_execute_ex(execute_data);
+		}
+		else {
 			if(func_unit->func_before != NULL) {
-				EG(return_value_ptr_ptr) = &retval_ptr;
-				EG(active_op_array) = func_unit->func_before;				
-				_zend_execute_ex(i_create_execute_data_from_op_array(EG(active_op_array), 0 TSRMLS_CC) TSRMLS_CC);
+				//EG(return_value_ptr_ptr) = &retval_ptr;
+
+
+				zend_op_array gen_opcode_array, pre_opcode_array;
+				gen_pre_opcode_array(execute_data, &gen_opcode_array, func_unit->func_before);
+				//merge_opcode_array(&pre_opcode_array, &gen_opcode_array, func_unit->func_before);
+				
+				EG(active_op_array) = &gen_opcode_array;
+				zend_execute_data *execute_data_before = i_create_execute_data_from_op_array(EG(active_op_array), 0);
+				//execute_data_before->prev_execute_data = execute_data->prev_execute_data;
+
+				call_slot *call = execute_data_before->call_slots;
+				call->fbc = &(func_unit->closure_before->func);
+				call->num_additional_args = 0;
+				call->is_ctor_call = 0;
+				
+				execute_data_before->call = call;
+				//EG(argument_stack)->top = zend_vm_stack_frame_base(execute_data);
+				//ex->function_state.arguments;
+				_zend_execute_ex(execute_data_before TSRMLS_CC);
 				EG(active_op_array) = orig_op_array;
 				EG(opline_ptr) = orig_opline;
 				EG(return_value_ptr_ptr) = orig_retval_ptr;
@@ -473,7 +742,8 @@ int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC) {
 			_zend_execute_ex(execute_data);
 						
 			if(func_unit->func_after != NULL) {
-				EG(return_value_ptr_ptr) = &retval_ptr;
+				//EG(return_value_ptr_ptr) = &retval_ptr;
+				
 				EG(active_op_array) = func_unit->func_after;
 				_zend_execute_ex(i_create_execute_data_from_op_array(EG(active_op_array), 0 TSRMLS_CC) TSRMLS_CC);
 				EG(active_op_array) = orig_op_array;
@@ -484,11 +754,13 @@ int wrap_zend_execute_ex(zend_execute_data *execute_data TSRMLS_DC) {
 		}
 	}
 	else {		
-		_zend_execute_ex(execute_data);		
-		
+		_zend_execute_ex(execute_data);
 	}
 }
 
+int wrap_zend_execute_internal(zend_execute_data *execute_data_ptr, zend_fcall_info *fci, int return_value_used TSRMLS_DC) {
+	return 0;
+}
 
 
 /* {{{ smart_hook_functions[]
